@@ -1,7 +1,7 @@
 services:
   server:
     build: .
-    image: lunar-tear:latest
+    image: kretts/lunar-tear:latest
     environment:
       LUNAR_HOST: 127.0.0.1
       LUNAR_HTTP_PORT: 8080

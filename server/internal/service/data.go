@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 
 	pb "lunar-tear/server/gen/proto"
 	"lunar-tear/server/internal/store"
@@ -11,6 +12,16 @@ import (
 
 	"google.golang.org/protobuf/types/known/emptypb"
 )
+
+// masterDataBinPath is the canonical location of the encrypted master data
+// file. The mtime of this file is folded into the version string so the
+// client invalidates its cache as soon as an admin reload swaps it in.
+const masterDataBinPath = "assets/release/20240404193219.bin.e"
+
+// masterDataBaseVersion preserves the historical "yyyymmddHHMMSS" value the
+// client has always seen; we suffix it with the file mtime to force a
+// re-download when content changes.
+const masterDataBaseVersion = "20240404193219"
 
 type DataServiceServer struct {
 	pb.UnimplementedDataServiceServer
@@ -23,9 +34,15 @@ func NewDataServiceServer(users store.UserRepository, sessions store.SessionRepo
 }
 
 func (s *DataServiceServer) GetLatestMasterDataVersion(ctx context.Context, _ *emptypb.Empty) (*pb.MasterDataGetLatestVersionResponse, error) {
-	log.Printf("[DataService] GetLatestMasterDataVersion")
+	version := masterDataBaseVersion
+	if info, err := os.Stat(masterDataBinPath); err == nil {
+		version = fmt.Sprintf("%s_%d", masterDataBaseVersion, info.ModTime().UnixMilli())
+	} else {
+		log.Printf("[DataService] stat %s: %v (falling back to base version)", masterDataBinPath, err)
+	}
+	log.Printf("[DataService] GetLatestMasterDataVersion -> %s", version)
 	return &pb.MasterDataGetLatestVersionResponse{
-		LatestMasterDataVersion: "20240404193219",
+		LatestMasterDataVersion: version,
 	}, nil
 }
 
@@ -41,13 +58,13 @@ func (s *DataServiceServer) GetUserDataNameV2(ctx context.Context, _ *emptypb.Em
 func (s *DataServiceServer) GetUserData(ctx context.Context, req *pb.UserDataGetRequest) (*pb.UserDataGetResponse, error) {
 	log.Printf("[DataService] GetUserData: tables=%v", req.TableName)
 
-	userId := currentUserId(ctx, s.users, s.sessions)
-	user, err := s.users.SnapshotUser(userId)
+	userId := CurrentUserId(ctx, s.users, s.sessions)
+	user, err := s.users.LoadUser(userId)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot user: %w", err)
 	}
 
-	defaults := userdata.FirstEntranceClientTableMap(user)
+	defaults := userdata.FullClientTableMap(user)
 	result := userdata.SelectTables(defaults, req.TableName)
 	return &pb.UserDataGetResponse{
 		UserDataJson: result,

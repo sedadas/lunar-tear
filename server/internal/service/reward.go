@@ -8,33 +8,34 @@ import (
 	"lunar-tear/server/internal/gametime"
 	"lunar-tear/server/internal/masterdata"
 	"lunar-tear/server/internal/model"
+	"lunar-tear/server/internal/runtime"
 	"lunar-tear/server/internal/store"
-	"lunar-tear/server/internal/userdata"
 
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
 )
 
 type RewardServiceServer struct {
 	pb.UnimplementedRewardServiceServer
-	users     store.UserRepository
-	sessions  store.SessionRepository
-	bhCatalog *masterdata.BigHuntCatalog
-	granter   *store.PossessionGranter
+	users    store.UserRepository
+	sessions store.SessionRepository
+	holder   *runtime.Holder
 }
 
 func NewRewardServiceServer(
 	users store.UserRepository,
 	sessions store.SessionRepository,
-	bhCatalog *masterdata.BigHuntCatalog,
-	granter *store.PossessionGranter,
+	holder *runtime.Holder,
 ) *RewardServiceServer {
-	return &RewardServiceServer{users: users, sessions: sessions, bhCatalog: bhCatalog, granter: granter}
+	return &RewardServiceServer{users: users, sessions: sessions, holder: holder}
 }
 
 func (s *RewardServiceServer) ReceiveBigHuntReward(ctx context.Context, _ *emptypb.Empty) (*pb.ReceiveBigHuntRewardResponse, error) {
 	log.Printf("[RewardService] ReceiveBigHuntReward")
 
-	userId := currentUserId(ctx, s.users, s.sessions)
+	cat := s.holder.Get()
+	bhCatalog := cat.BigHunt
+	granter := cat.QuestHandler.Granter
+	userId := CurrentUserId(ctx, s.users, s.sessions)
 	nowMillis := gametime.NowMillis()
 	weeklyVersion := gametime.WeeklyVersion(nowMillis)
 
@@ -42,17 +43,17 @@ func (s *RewardServiceServer) ReceiveBigHuntReward(ctx context.Context, _ *empty
 	var weeklyRewards []*pb.BigHuntReward
 	isReceived := false
 
-	user, _ := s.users.UpdateUser(userId, func(user *store.UserState) {
+	s.users.UpdateUser(userId, func(user *store.UserState) {
 		ws := user.BigHuntWeeklyStatuses[weeklyVersion]
 		isReceived = ws.IsReceivedWeeklyReward
 
-		for _, boss := range s.bhCatalog.BossByBossId {
+		for _, boss := range bhCatalog.BossByBossId {
 			key := store.BigHuntWeeklyScoreKey{
 				BigHuntWeeklyVersion: weeklyVersion,
 				AttributeType:        boss.AttributeType,
 			}
 			wms := user.BigHuntWeeklyMaxScores[key]
-			gradeIcon := s.bhCatalog.ResolveGradeIconId(boss.BigHuntBossId, wms.MaxScore)
+			gradeIcon := bhCatalog.ResolveGradeIconId(boss.BigHuntBossId, wms.MaxScore)
 			weeklyScoreResults = append(weeklyScoreResults, &pb.WeeklyScoreResult{
 				AttributeType:           boss.AttributeType,
 				BeforeMaxScore:          wms.MaxScore,
@@ -65,12 +66,12 @@ func (s *RewardServiceServer) ReceiveBigHuntReward(ctx context.Context, _ *empty
 		}
 
 		if !isReceived {
-			for _, boss := range s.bhCatalog.BossByBossId {
+			for _, boss := range bhCatalog.BossByBossId {
 				rewardKey := masterdata.BigHuntWeeklyRewardKey{
 					ScheduleId:    1,
 					AttributeType: boss.AttributeType,
 				}
-				rewardGroupId := s.bhCatalog.ResolveActiveWeeklyRewardGroupId(rewardKey, nowMillis)
+				rewardGroupId := bhCatalog.ResolveActiveWeeklyRewardGroupId(rewardKey, nowMillis)
 				if rewardGroupId == 0 {
 					continue
 				}
@@ -81,9 +82,9 @@ func (s *RewardServiceServer) ReceiveBigHuntReward(ctx context.Context, _ *empty
 				}
 				maxScore := user.BigHuntWeeklyMaxScores[weekKey].MaxScore
 
-				items := s.bhCatalog.CollectNewRewards(rewardGroupId, 0, maxScore)
+				items := bhCatalog.CollectNewRewards(rewardGroupId, 0, maxScore)
 				for _, item := range items {
-					s.granter.GrantFull(user, model.PossessionType(item.PossessionType), item.PossessionId, item.Count, nowMillis)
+					granter.GrantFull(user, model.PossessionType(item.PossessionType), item.PossessionId, item.Count, nowMillis)
 					weeklyRewards = append(weeklyRewards, &pb.BigHuntReward{
 						PossessionType: item.PossessionType,
 						PossessionId:   item.PossessionId,
@@ -106,19 +107,11 @@ func (s *RewardServiceServer) ReceiveBigHuntReward(ctx context.Context, _ *empty
 		weeklyScoreResults = []*pb.WeeklyScoreResult{}
 	}
 
-	tables := userdata.SelectTables(userdata.FullClientTableMap(user), []string{
-		"IUserBigHuntWeeklyStatus",
-		"IUserBigHuntWeeklyMaxScore",
-		"IUserConsumableItem",
-		"IUserMaterial",
-	})
-
 	return &pb.ReceiveBigHuntRewardResponse{
 		WeeklyScoreResult:           weeklyScoreResults,
 		WeeklyScoreReward:           weeklyRewards,
 		IsReceivedWeeklyScoreReward: isReceived,
 		LastWeekWeeklyScoreReward:   []*pb.BigHuntReward{},
-		DiffUserData:                userdata.BuildDiffFromTables(tables),
 	}, nil
 }
 

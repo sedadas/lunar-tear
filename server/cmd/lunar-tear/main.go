@@ -1,207 +1,60 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"os"
-	"strconv"
-	"strings"
+	"os/signal"
+	"syscall"
 
-	"lunar-tear/server/internal/gacha"
+	"lunar-tear/server/internal/database"
 	"lunar-tear/server/internal/gametime"
-	"lunar-tear/server/internal/masterdata"
-	"lunar-tear/server/internal/questflow"
-	"lunar-tear/server/internal/store/memory"
+	"lunar-tear/server/internal/runtime"
+	"lunar-tear/server/internal/store/sqlite"
 )
 
+const masterDataPath = "assets/release/20240404193219.bin.e"
+
 func main() {
-	httpPort := flag.Int("http-port", 8080, "HTTP server port (Octo API)")
-	host := flag.String("host", "127.0.0.1", "hostname the client will connect to")
-	scene := flag.Int("scene", 0, "Bootstrap to scene N (0 = fresh start)")
-	latestScene := flag.Bool("latest-scene", false, "Bootstrap from the most recently saved snapshot (overrides -scene)")
-	starterItems := flag.Bool("starter-items", false, "Grant starter items to new users")
+	listen := flag.String("listen", "0.0.0.0:443", "gRPC listen address (host:port)")
+	publicAddr := flag.String("public-addr", "127.0.0.1:443", "externally-reachable host:port advertised to clients")
+	dbPath := flag.String("db", "db/game.db", "SQLite database path")
+	octoURL := flag.String("octo-url", "", "Octo CDN base URL the client will use for assets (e.g. http://10.0.2.2:8080)")
+	authURL := flag.String("auth-url", "", "Auth server base URL for Facebook token validation (e.g. http://localhost:3000)")
+	adminListen := flag.String("admin-listen", "127.0.0.1:8082", "admin webhook listen address (host:port). Loopback by default; only binds when LUNAR_ADMIN_TOKEN is set.")
 	flag.Parse()
 
-	octoURL := "http://" + *host + ":" + strconv.Itoa(*httpPort)
-	prefix := octoURL + "/"
-	padLen := 43 - len(prefix)
-	resourcesBaseURL := ""
-	if padLen < 1 {
-		log.Printf("[config] host:port too long for 43-char resource URL; list.bin will be served unchanged")
-	} else {
-		resourcesBaseURL = prefix + strings.Repeat("r", padLen)
+	if *octoURL == "" {
+		log.Fatalf("--octo-url is required (e.g. http://10.0.2.2:8080)")
 	}
 
-	go startHTTP(*httpPort, resourcesBaseURL)
-
-	snapshotDir := "snapshots"
-	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
-		log.Fatalf("create snapshot dir: %v", err)
-	}
-	if *latestScene {
-		if id, ok := memory.LatestSnapshotSceneId(snapshotDir); ok {
-			*scene = int(id)
-			log.Printf("[latest-scene] auto-selected most recent snapshot: scene=%d", id)
-		} else {
-			log.Printf("[latest-scene] no snapshots found in %q; starting fresh", snapshotDir)
-		}
-	}
-
-	gameConfig, err := masterdata.LoadGameConfig()
+	holder, err := runtime.NewHolder(masterDataPath)
 	if err != nil {
-		log.Fatalf("load game config: %v", err)
+		log.Fatalf("init master data: %v", err)
 	}
-	log.Printf("game config loaded (goldId=%d, skipTicketId=%d, rebirthGold=%d)",
-		gameConfig.ConsumableItemIdForGold, gameConfig.ConsumableItemIdForQuestSkipTicket, gameConfig.CharacterRebirthConsumeGold)
 
-	partsCatalog, err := masterdata.LoadPartsCatalog()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	db, err := database.Open(*dbPath)
 	if err != nil {
-		log.Fatalf("load parts catalog: %v", err)
+		log.Fatalf("open database: %v", err)
 	}
-	log.Printf("parts catalog loaded: %d parts, %d rarities", len(partsCatalog.PartsById), len(partsCatalog.RarityByRarityType))
+	defer db.Close()
+	log.Printf("database opened: %s", *dbPath)
 
-	questCatalog, err := masterdata.LoadQuestCatalog(partsCatalog)
-	if err != nil {
-		log.Fatalf("load quest catalog: %v", err)
-	}
-	questHandler := questflow.NewQuestHandler(questCatalog, gameConfig)
-	userStore := memory.New(gametime.Now,
-		memory.WithSnapshotDir(snapshotDir),
-		memory.WithSceneId(int32(*scene)),
-		memory.WithStarterItems(*starterItems),
-	)
-	if *scene != 0 {
-		log.Printf("bootstrap scene: %d (from snapshot)", *scene)
-	}
+	userStore := sqlite.New(db, gametime.Now)
 
-	gachaEntries, medalInfo, err := masterdata.LoadGachaCatalog()
-	if err != nil {
-		log.Fatalf("load gacha catalog: %v", err)
-	}
-	log.Printf("gacha catalog loaded: %d entries", len(gachaEntries))
+	grpcServer := startGRPC(*listen, *publicAddr, *octoURL, *authURL, userStore, holder)
 
-	gachaPool, err := masterdata.LoadGachaPool()
-	if err != nil {
-		log.Fatalf("load gacha pool: %v", err)
-	}
-	log.Printf("gacha pool loaded: costumes=%d rarities, weapons=%d rarities, materials=%d",
-		len(gachaPool.CostumesByRarity), len(gachaPool.WeaponsByRarity), len(gachaPool.Materials))
+	startAdmin(*adminListen, holder)
 
-	shopCatalog, err := masterdata.LoadShopCatalog()
-	if err != nil {
-		log.Fatalf("load shop catalog: %v", err)
-	}
-	log.Printf("shop catalog loaded: %d items, %d content groups, %d exchange shops",
-		len(shopCatalog.Items), len(shopCatalog.Contents), len(shopCatalog.ExchangeShopCells))
+	<-ctx.Done()
+	log.Println("shutting down...")
 
-	gachaPool.BuildShopFeatured(shopCatalog)
-	gachaPool.PruneUnpairedCostumes()
-	gachaPool.BuildFeaturedMapping(gachaEntries)
-	gachaPool.BuildBannerPools(gachaEntries)
-	masterdata.EnrichCatalogPromotions(gachaEntries, gachaPool)
-	userStore.ReplaceCatalog(gachaEntries)
+	grpcServer.GracefulStop()
+	database.Checkpoint(db)
 
-	dupExchange, err := masterdata.LoadDupExchange()
-	if err != nil {
-		log.Fatalf("load dup exchange: %v", err)
-	}
-	dupAdded, err := masterdata.EnrichDupExchange(dupExchange, gachaPool)
-	if err != nil {
-		log.Fatalf("enrich dup exchange: %v", err)
-	}
-	log.Printf("dup exchange loaded: %d entries (%d derived from limit-break materials)", len(dupExchange), dupAdded)
-
-	gachaHandler := gacha.NewGachaHandler(gachaPool, gameConfig, questHandler.Granter, medalInfo, dupExchange)
-
-	conditionResolver, err := masterdata.LoadConditionResolver()
-	if err != nil {
-		log.Fatalf("load condition resolver: %v", err)
-	}
-
-	cageOrnamentCatalog := masterdata.LoadCageOrnamentCatalog()
-	loginBonusCatalog := masterdata.LoadLoginBonusCatalog()
-	characterViewerCatalog := masterdata.LoadCharacterViewerCatalog(conditionResolver)
-	omikujiCatalog := masterdata.LoadOmikujiCatalog()
-
-	materialCatalog, err := masterdata.LoadMaterialCatalog()
-	if err != nil {
-		log.Fatalf("load material catalog: %v", err)
-	}
-	log.Printf("material catalog loaded: %d materials", len(materialCatalog.All))
-
-	consumableItemCatalog, err := masterdata.LoadConsumableItemCatalog()
-	if err != nil {
-		log.Fatalf("load consumable item catalog: %v", err)
-	}
-	log.Printf("consumable item catalog loaded: %d items", len(consumableItemCatalog.All))
-
-	costumeCatalog, err := masterdata.LoadCostumeCatalog(materialCatalog)
-	if err != nil {
-		log.Fatalf("load costume catalog: %v", err)
-	}
-	log.Printf("costume catalog loaded: %d costumes, %d materials, %d rarity curves", len(costumeCatalog.Costumes), len(costumeCatalog.Materials), len(costumeCatalog.ExpByRarity))
-
-	weaponCatalog, err := masterdata.LoadWeaponCatalog(materialCatalog)
-	if err != nil {
-		log.Fatalf("load weapon catalog: %v", err)
-	}
-	log.Printf("weapon catalog loaded: %d weapons, %d materials, %d enhance configs", len(weaponCatalog.Weapons), len(weaponCatalog.Materials), len(weaponCatalog.ExpByEnhanceId))
-
-	exploreCatalog, err := masterdata.LoadExploreCatalog()
-	if err != nil {
-		log.Fatalf("load explore catalog: %v", err)
-	}
-	log.Printf("explore catalog loaded: %d explores, %d grade assets", len(exploreCatalog.Explores), len(exploreCatalog.GradeAssets))
-
-	gimmickCatalog, err := masterdata.LoadGimmickCatalog(conditionResolver)
-	if err != nil {
-		log.Fatalf("load gimmick catalog: %v", err)
-	}
-
-	characterBoardCatalog, err := masterdata.LoadCharacterBoardCatalog()
-	if err != nil {
-		log.Fatalf("load character board catalog: %v", err)
-	}
-	log.Printf("character board catalog loaded: %d panels, %d boards", len(characterBoardCatalog.PanelById), len(characterBoardCatalog.BoardById))
-
-	characterRebirthCatalog, err := masterdata.LoadCharacterRebirthCatalog()
-	if err != nil {
-		log.Fatalf("load character rebirth catalog: %v", err)
-	}
-	log.Printf("character rebirth catalog loaded: %d characters", len(characterRebirthCatalog.StepGroupByCharacterId))
-
-	companionCatalog, err := masterdata.LoadCompanionCatalog()
-	if err != nil {
-		log.Fatalf("load companion catalog: %v", err)
-	}
-	log.Printf("companion catalog loaded: %d companions, %d categories", len(companionCatalog.CompanionById), len(companionCatalog.GoldCostByCategory))
-
-	sideStoryCatalog := masterdata.LoadSideStoryCatalog()
-	bigHuntCatalog := masterdata.LoadBigHuntCatalog()
-
-	startGRPC(
-		*host,
-		octoURL,
-		userStore,
-		questHandler,
-		gachaHandler,
-		cageOrnamentCatalog,
-		loginBonusCatalog,
-		characterViewerCatalog,
-		shopCatalog,
-		costumeCatalog,
-		omikujiCatalog,
-		weaponCatalog,
-		exploreCatalog,
-		gimmickCatalog,
-		characterBoardCatalog,
-		partsCatalog,
-		characterRebirthCatalog,
-		companionCatalog,
-		materialCatalog,
-		consumableItemCatalog,
-		gameConfig,
-		sideStoryCatalog,
-		bigHuntCatalog,
-	)
+	log.Println("shutdown complete")
 }

@@ -1,5 +1,45 @@
 # Changelog
 
+## 2026-04-25
+
+### Working
+
+- SQLite persistence layer with snapshot import tool
+- Authentication server with login UI
+- Wizard CLI for guided first-time setup
+- Dev runner (`make dev`) with automatic service builds
+- Memoir sub-status system with level-based unlocks
+- Companion and parts granting from the shop
+- `CopyDeck` / `RemoveDeck` deck management
+- Karma functionality
+- Docker multi-service orchestration (auth, CDN, gRPC) with cross-platform improvements
+- `--grpc-port` CLI flag
+
+### Fixed
+
+- Gate desync on quest-finish crash — scene now advances atomically
+- Equipment duplication in deck management
+
+## 2026-04-18
+
+### Working
+
+- Weapon awakening
+- Consumable item selling
+- `--latest-scene` CLI flag for resuming from the most recent quest scene on startup
+- Docker support (Dockerfile, docker-compose, entrypoint)
+- GitHub Actions CI for Docker image builds
+
+### Fixed
+
+- Locale fallback MD5 validation for ja/ko -> en asset candidates
+- UTF-8 handling for non-ASCII characters in asset path processing
+- Tutorial progress no longer overwrites existing progress unless the new phase is greater
+- Repeated weapon story unlock notifications — diffs now only send changed stories
+- Unique key generation for weapon grants to prevent overwrites in gacha/rewards
+- Missing `IUserWeaponStory` in `startedGameStartTables`
+- Max level evaluation in costume `EnhanceActiveSkill`
+
 ## 2026-04-11
 
 ### Working

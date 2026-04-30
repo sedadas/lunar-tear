@@ -6,29 +6,28 @@ import (
 
 	pb "lunar-tear/server/gen/proto"
 	"lunar-tear/server/internal/gametime"
-	"lunar-tear/server/internal/masterdata"
+	"lunar-tear/server/internal/runtime"
 	"lunar-tear/server/internal/store"
-	"lunar-tear/server/internal/userdata"
 
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
 )
 
 type GimmickServiceServer struct {
 	pb.UnimplementedGimmickServiceServer
-	users          store.UserRepository
-	sessions       store.SessionRepository
-	gimmickCatalog *masterdata.GimmickCatalog
+	users    store.UserRepository
+	sessions store.SessionRepository
+	holder   *runtime.Holder
 }
 
-func NewGimmickServiceServer(users store.UserRepository, sessions store.SessionRepository, gimmickCatalog *masterdata.GimmickCatalog) *GimmickServiceServer {
-	return &GimmickServiceServer{users: users, sessions: sessions, gimmickCatalog: gimmickCatalog}
+func NewGimmickServiceServer(users store.UserRepository, sessions store.SessionRepository, holder *runtime.Holder) *GimmickServiceServer {
+	return &GimmickServiceServer{users: users, sessions: sessions, holder: holder}
 }
 
 func (s *GimmickServiceServer) UpdateSequence(ctx context.Context, req *pb.UpdateSequenceRequest) (*pb.UpdateSequenceResponse, error) {
 	log.Printf("[GimmickService] UpdateSequence: scheduleId=%d sequenceId=%d",
 		req.GimmickSequenceScheduleId, req.GimmickSequenceId)
-	userId := currentUserId(ctx, s.users, s.sessions)
-	user, _ := s.users.UpdateUser(userId, func(user *store.UserState) {
+	userId := CurrentUserId(ctx, s.users, s.sessions)
+	s.users.UpdateUser(userId, func(user *store.UserState) {
 		key := store.GimmickSequenceKey{
 			GimmickSequenceScheduleId: req.GimmickSequenceScheduleId,
 			GimmickSequenceId:         req.GimmickSequenceId,
@@ -37,16 +36,14 @@ func (s *GimmickServiceServer) UpdateSequence(ctx context.Context, req *pb.Updat
 		sequence.Key = key
 		user.Gimmick.Sequences[key] = sequence
 	})
-	return &pb.UpdateSequenceResponse{
-		DiffUserData: userdata.BuildDiffFromTables(userdata.SelectTables(userdata.FullClientTableMap(user), []string{"IUserGimmickSequence"})),
-	}, nil
+	return &pb.UpdateSequenceResponse{}, nil
 }
 
 func (s *GimmickServiceServer) UpdateGimmickProgress(ctx context.Context, req *pb.UpdateGimmickProgressRequest) (*pb.UpdateGimmickProgressResponse, error) {
 	log.Printf("[GimmickService] UpdateGimmickProgress: scheduleId=%d sequenceId=%d gimmickId=%d ornamentIndex=%d progressValueBit=%d flowType=%d",
 		req.GimmickSequenceScheduleId, req.GimmickSequenceId, req.GimmickId, req.GimmickOrnamentIndex, req.ProgressValueBit, req.FlowType)
-	userId := currentUserId(ctx, s.users, s.sessions)
-	user, _ := s.users.UpdateUser(userId, func(user *store.UserState) {
+	userId := CurrentUserId(ctx, s.users, s.sessions)
+	s.users.UpdateUser(userId, func(user *store.UserState) {
 		nowMillis := gametime.NowMillis()
 		progressKey := store.GimmickKey{
 			GimmickSequenceScheduleId: req.GimmickSequenceScheduleId,
@@ -74,20 +71,16 @@ func (s *GimmickServiceServer) UpdateGimmickProgress(ctx context.Context, req *p
 		GimmickOrnamentReward:      []*pb.GimmickReward{},
 		IsSequenceCleared:          false,
 		GimmickSequenceClearReward: []*pb.GimmickReward{},
-		DiffUserData: userdata.BuildDiffFromTables(userdata.SelectTables(userdata.FullClientTableMap(user), []string{
-			"IUserGimmick",
-			"IUserGimmickOrnamentProgress",
-		})),
 	}, nil
 }
 
 func (s *GimmickServiceServer) InitSequenceSchedule(ctx context.Context, _ *emptypb.Empty) (*pb.InitSequenceScheduleResponse, error) {
 	log.Printf("[GimmickService] InitSequenceSchedule")
-	userId := currentUserId(ctx, s.users, s.sessions)
+	userId := CurrentUserId(ctx, s.users, s.sessions)
 	now := gametime.NowMillis()
-	user, _ := s.users.UpdateUser(userId, func(user *store.UserState) {
+	s.users.UpdateUser(userId, func(user *store.UserState) {
 		added := 0
-		for _, key := range s.gimmickCatalog.ActiveScheduleKeys(*user, now) {
+		for _, key := range s.holder.Get().Gimmick.ActiveScheduleKeys(*user, now) {
 			if _, exists := user.Gimmick.Sequences[key]; !exists {
 				user.Gimmick.Sequences[key] = store.GimmickSequenceState{Key: key}
 				added++
@@ -97,15 +90,13 @@ func (s *GimmickServiceServer) InitSequenceSchedule(ctx context.Context, _ *empt
 			log.Printf("[GimmickService] InitSequenceSchedule: added %d sequences (total %d)", added, len(user.Gimmick.Sequences))
 		}
 	})
-	return &pb.InitSequenceScheduleResponse{
-		DiffUserData: userdata.BuildDiffFromTables(userdata.SelectTables(userdata.FullClientTableMap(user), gimmickDiffTables)),
-	}, nil
+	return &pb.InitSequenceScheduleResponse{}, nil
 }
 
 func (s *GimmickServiceServer) Unlock(ctx context.Context, req *pb.UnlockRequest) (*pb.UnlockResponse, error) {
 	log.Printf("[GimmickService] Unlock: gimmickKeys=%d", len(req.GimmickKey))
-	userId := currentUserId(ctx, s.users, s.sessions)
-	user, _ := s.users.UpdateUser(userId, func(user *store.UserState) {
+	userId := CurrentUserId(ctx, s.users, s.sessions)
+	s.users.UpdateUser(userId, func(user *store.UserState) {
 		for _, item := range req.GimmickKey {
 			key := store.GimmickKey{
 				GimmickSequenceScheduleId: item.GimmickSequenceScheduleId,
@@ -118,7 +109,5 @@ func (s *GimmickServiceServer) Unlock(ctx context.Context, req *pb.UnlockRequest
 			user.Gimmick.Unlocks[key] = unlock
 		}
 	})
-	return &pb.UnlockResponse{
-		DiffUserData: userdata.BuildDiffFromTables(userdata.SelectTables(userdata.FullClientTableMap(user), []string{"IUserGimmickUnlock"})),
-	}, nil
+	return &pb.UnlockResponse{}, nil
 }

@@ -50,6 +50,7 @@ const resourcesURLOriginal = "https://resources.app.nierreincarnation.com"
 type OctoHTTPServer struct {
 	mux              *http.ServeMux
 	ResourcesBaseURL string // if non-empty and exactly 43 chars, list.bin is rewritten to use this base for asset URLs
+	BaseDir          string // root directory containing the assets/ tree; empty means current directory
 	revisions        *revisionTracker
 	resolver         *assetResolver
 }
@@ -124,14 +125,17 @@ func fileMD5Hex(path string, info os.FileInfo) (string, error) {
 	return sum, nil
 }
 
-func NewOctoHTTPServer(resourcesBaseURL string) *OctoHTTPServer {
+func NewOctoHTTPServer(resourcesBaseURL, baseDir string) *OctoHTTPServer {
 	s := &OctoHTTPServer{
 		mux:              http.NewServeMux(),
 		ResourcesBaseURL: resourcesBaseURL,
+		BaseDir:          baseDir,
 		revisions:        newRevisionTracker(),
-		resolver:         newAssetResolver(),
+		resolver:         newAssetResolver(baseDir),
 	}
-	s.resolver.Prewarm("0")
+	s.resolver.Prewarm("0", platformAndroid)
+	s.resolver.Prewarm("0", platformIOS)
+	s.resolver.Prewarm("0", "")
 	s.mux.HandleFunc("/", s.handleAll)
 	return s
 }
@@ -140,12 +144,24 @@ func (s *OctoHTTPServer) Handler() http.Handler {
 	return s.mux
 }
 
+// listBinPath prefers the platform-split list.bin and falls back to the un-split shared tree
+// when the platform-specific file is missing, so operators with a single unified asset dump
+// keep working.
+func (s *OctoHTTPServer) listBinPath(revision, platform string) string {
+	p := filepath.Join(s.BaseDir, "assets", "revisions", revision, platform, "list.bin")
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	return filepath.Join(s.BaseDir, "assets", "revisions", revision, "list.bin")
+}
+
 func (s *OctoHTTPServer) handleAll(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
+	platform := platformFromUserAgent(r)
 	isAssetRequest := strings.Contains(path, "/unso-")
 	isMasterDataRequest := strings.Contains(path, "/assets/release/") && strings.Contains(path, "database.bin")
 	if !isAssetRequest && !isMasterDataRequest {
-		log.Printf("[HTTP] %s %s (Host: %s)", r.Method, r.URL.String(), r.Host)
+		log.Printf("[HTTP] %s %s (Host: %s, platform: %s)", r.Method, r.URL.String(), r.Host, platform)
 		for k, v := range r.Header {
 			log.Printf("[HTTP]   %s: %s", k, v)
 		}
@@ -153,13 +169,13 @@ func (s *OctoHTTPServer) handleAll(w http.ResponseWriter, r *http.Request) {
 
 	// Octo v2 API — asset bundle management
 	if strings.HasPrefix(path, "/v2/") {
-		s.handleOctoV2(w, r, path)
+		s.handleOctoV2(w, r, path, platform)
 		return
 	}
 
 	// Octo v1 list: /v1/list/{version}/{revision} — same list.bin as v2, keyed by revision
 	if strings.HasPrefix(path, "/v1/list/") {
-		s.serveOctoV1List(w, r, path)
+		s.serveOctoV1List(w, r, path, platform)
 		return
 	}
 
@@ -186,7 +202,7 @@ func (s *OctoHTTPServer) handleAll(w http.ResponseWriter, r *http.Request) {
 
 	// Asset bundle requests (from list.bin URLs: .../unso-{v}-{type}/{o}?generation=...&alt=media)
 	if strings.Contains(path, "/unso-") {
-		s.serveUnsoAsset(w, r, path)
+		s.serveUnsoAsset(w, r, path, platform)
 		return
 	}
 
@@ -216,8 +232,8 @@ func (s *OctoHTTPServer) handleAll(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte{})
 }
 
-func (s *OctoHTTPServer) handleOctoV2(w http.ResponseWriter, r *http.Request, path string) {
-	log.Printf("[OctoV2] %s %s", r.Method, path)
+func (s *OctoHTTPServer) handleOctoV2(w http.ResponseWriter, r *http.Request, path, platform string) {
+	log.Printf("[OctoV2] %s %s (platform=%s)", r.Method, path, platform)
 
 	// /v2/pub/a/{appId}/v/{version}/list/{offset} — resource listing
 	if strings.Contains(path, "/list/") {
@@ -226,13 +242,13 @@ func (s *OctoHTTPServer) handleOctoV2(w http.ResponseWriter, r *http.Request, pa
 			requestedRevision := parts[len(parts)-1]
 			if requestedRevision != "" {
 				revision := "0"
-				filePath := "assets/revisions/0/list.bin"
+				filePath := s.listBinPath(revision, platform)
 				if requestedRevision != revision {
 					log.Printf("[OctoV2] Resource list request revision=%s canonicalized to revision=%s", requestedRevision, revision)
 				}
-				log.Printf("[OctoV2] Resource list request — serving %s (requested_revision=%s canonical_revision=%s)", filePath, requestedRevision, revision)
+				log.Printf("[OctoV2] Resource list request — serving %s (requested_revision=%s canonical_revision=%s platform=%s)", filePath, requestedRevision, revision, platform)
 				s.revisions.Remember(r.RemoteAddr, revision)
-				go s.resolver.Prewarm(revision)
+				go s.resolver.Prewarm(revision, platform)
 				s.serveListBin(w, filePath)
 				return
 			}
@@ -257,8 +273,8 @@ func (s *OctoHTTPServer) handleOctoV2(w http.ResponseWriter, r *http.Request, pa
 	w.WriteHeader(200)
 }
 
-// serveOctoV1List handles GET /v1/list/{version}/{revision} — serves assets/revisions/{revision}/list.bin.
-func (s *OctoHTTPServer) serveOctoV1List(w http.ResponseWriter, r *http.Request, path string) {
+// serveOctoV1List handles GET /v1/list/{version}/{revision} — serves assets/revisions/{revision}/{platform}/list.bin.
+func (s *OctoHTTPServer) serveOctoV1List(w http.ResponseWriter, r *http.Request, path, platform string) {
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	// ["v1", "list", "300116832", "0"] -> revision = last segment
 	requestedRevision := "0"
@@ -266,18 +282,18 @@ func (s *OctoHTTPServer) serveOctoV1List(w http.ResponseWriter, r *http.Request,
 		requestedRevision = parts[len(parts)-1]
 	}
 	revision := "0"
-	filePath := "assets/revisions/0/list.bin"
+	filePath := s.listBinPath(revision, platform)
 	if requestedRevision != revision {
 		log.Printf("[OctoV1] list request revision=%s canonicalized to revision=%s", requestedRevision, revision)
 	}
-	log.Printf("[OctoV1] %s %s — serving %s (requested_revision=%s canonical_revision=%s)", r.Method, path, filePath, requestedRevision, revision)
+	log.Printf("[OctoV1] %s %s — serving %s (requested_revision=%s canonical_revision=%s platform=%s)", r.Method, path, filePath, requestedRevision, revision, platform)
 	s.revisions.Remember(r.RemoteAddr, revision)
-	go s.resolver.Prewarm(revision)
+	go s.resolver.Prewarm(revision, platform)
 	s.serveListBin(w, filePath)
 }
 
 // serveUnsoAsset serves asset bundle or resource for URLs like /resource-bundle-server/unso-{version}-{type}/{object_id}.
-func (s *OctoHTTPServer) serveUnsoAsset(w http.ResponseWriter, r *http.Request, path string) {
+func (s *OctoHTTPServer) serveUnsoAsset(w http.ResponseWriter, r *http.Request, path, platform string) {
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	var segment, objectId string
 	for i, p := range parts {
@@ -309,18 +325,18 @@ func (s *OctoHTTPServer) serveUnsoAsset(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	activeRevision := s.revisions.Active(r.RemoteAddr)
-	resolution, ok := s.resolver.Resolve(objectId, assetType, activeRevision)
+	resolution, ok := s.resolver.Resolve(objectId, assetType, activeRevision, platform)
 	if !ok {
-		log.Printf("[HTTP] Asset not found: %s (object_id=%s type=%s active_revision=%s) no candidates", path, objectId, assetType, activeRevision)
+		log.Printf("[HTTP] Asset not found: %s (object_id=%s type=%s platform=%s active_revision=%s) no candidates", path, objectId, assetType, platform, activeRevision)
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	baseDir := filepath.Join("assets", "revisions")
+	revDir := filepath.Join(s.BaseDir, "assets", "revisions")
 	var triedPaths []string
 	var md5Mismatches []string
 	for _, candidate := range resolution.Candidates {
-		rel, err := filepath.Rel(baseDir, candidate.Path)
+		rel, err := filepath.Rel(revDir, candidate.Path)
 		if err != nil || strings.Contains(rel, "..") || filepath.IsAbs(rel) {
 			continue
 		}
@@ -352,7 +368,7 @@ func (s *OctoHTTPServer) serveUnsoAsset(w http.ResponseWriter, r *http.Request, 
 			}
 			if !strings.EqualFold(actualMD5, candidate.ExpectedMD5) {
 				md5Mismatches = append(md5Mismatches, candidate.Revision+":"+candidate.Path+" ["+candidate.Source+"] expected="+candidate.ExpectedMD5+" actual="+actualMD5)
-				log.Printf("[HTTP] Asset md5 mismatch: object_id=%s type=%s path=%s expected=%s actual=%s active_revision=%s list_revision=%s resolved_revision=%s source=%s", objectId, assetType, candidate.Path, candidate.ExpectedMD5, actualMD5, resolution.ActiveRevision, resolution.ListRevision, candidate.Revision, candidate.Source)
+				log.Printf("[HTTP] Asset md5 mismatch: object_id=%s type=%s platform=%s path=%s expected=%s actual=%s active_revision=%s list_revision=%s resolved_revision=%s source=%s", objectId, assetType, platform, candidate.Path, candidate.ExpectedMD5, actualMD5, resolution.ActiveRevision, resolution.ListRevision, candidate.Revision, candidate.Source)
 				f.Close()
 				continue
 			}
@@ -364,9 +380,9 @@ func (s *OctoHTTPServer) serveUnsoAsset(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	if len(md5Mismatches) > 0 {
-		log.Printf("[HTTP] Asset md5 mismatches: object_id=%s type=%s active_revision=%s list_revision=%s mismatches=%v", objectId, assetType, resolution.ActiveRevision, resolution.ListRevision, md5Mismatches)
+		log.Printf("[HTTP] Asset md5 mismatches: object_id=%s type=%s platform=%s active_revision=%s list_revision=%s mismatches=%v", objectId, assetType, platform, resolution.ActiveRevision, resolution.ListRevision, md5Mismatches)
 	}
-	log.Printf("[HTTP] Asset not found: %s (object_id=%s type=%s active_revision=%s list_revision=%s) tried paths: %v", path, objectId, assetType, resolution.ActiveRevision, resolution.ListRevision, triedPaths)
+	log.Printf("[HTTP] Asset not found: %s (object_id=%s type=%s platform=%s active_revision=%s list_revision=%s) tried paths: %v", path, objectId, assetType, platform, resolution.ActiveRevision, resolution.ListRevision, triedPaths)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.WriteHeader(http.StatusNotFound)
 }
@@ -398,24 +414,12 @@ func (s *OctoHTTPServer) serveListBin(w http.ResponseWriter, filePath string) {
 	w.Write(data)
 }
 
-// serveDatabaseBinE serves MasterMemory database: /assets/release/{version}/database.bin.e
-// -> assets/release/{version}.bin.e (or assets/release/database.bin.e fallback).
-func (s *OctoHTTPServer) serveDatabaseBinE(w http.ResponseWriter, r *http.Request, path string) {
-	parts := strings.Split(path, "/")
-	var version string
-	for i, p := range parts {
-		if p == "release" && i+1 < len(parts) {
-			version = parts[i+1]
-			break
-		}
-	}
-	filePath := "assets/release/database.bin.e"
-	if version != "" {
-		vPath := "assets/release/" + version + ".bin.e"
-		if _, err := os.Stat(vPath); err == nil {
-			filePath = vPath
-		}
-	}
+// serveDatabaseBinE serves the master data binary. The URL's {version} segment
+// is a cache key (it changes whenever the file's mtime changes, see
+// DataService.GetLatestMasterDataVersion) but does not select a different file —
+// there's only ever one bin.e on disk.
+func (s *OctoHTTPServer) serveDatabaseBinE(w http.ResponseWriter, r *http.Request, _ string) {
+	filePath := filepath.Join(s.BaseDir, "assets", "release", "20240404193219.bin.e")
 	w.Header().Set("Content-Type", "application/octet-stream")
 	http.ServeFile(w, r, filePath)
 }

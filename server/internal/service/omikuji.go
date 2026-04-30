@@ -7,41 +7,36 @@ import (
 
 	pb "lunar-tear/server/gen/proto"
 	"lunar-tear/server/internal/gametime"
-	"lunar-tear/server/internal/masterdata"
+	"lunar-tear/server/internal/runtime"
 	"lunar-tear/server/internal/store"
-	"lunar-tear/server/internal/userdata"
 )
 
 type OmikujiServiceServer struct {
 	pb.UnimplementedOmikujiServiceServer
 	users    store.UserRepository
 	sessions store.SessionRepository
-	catalog  *masterdata.OmikujiCatalog
+	holder   *runtime.Holder
 }
 
-func NewOmikujiServiceServer(users store.UserRepository, sessions store.SessionRepository, catalog *masterdata.OmikujiCatalog) *OmikujiServiceServer {
-	return &OmikujiServiceServer{users: users, sessions: sessions, catalog: catalog}
+func NewOmikujiServiceServer(users store.UserRepository, sessions store.SessionRepository, holder *runtime.Holder) *OmikujiServiceServer {
+	return &OmikujiServiceServer{users: users, sessions: sessions, holder: holder}
 }
 
 func (s *OmikujiServiceServer) OmikujiDraw(ctx context.Context, req *pb.OmikujiDrawRequest) (*pb.OmikujiDrawResponse, error) {
 	log.Printf("[OmikujiService] OmikujiDraw: omikujiId=%d", req.OmikujiId)
 
-	userId := currentUserId(ctx, s.users, s.sessions)
+	userId := CurrentUserId(ctx, s.users, s.sessions)
 	now := gametime.NowMillis()
 
-	snapshot, err := s.users.UpdateUser(userId, func(user *store.UserState) {
+	_, err := s.users.UpdateUser(userId, func(user *store.UserState) {
 		user.DrawnOmikuji[req.OmikujiId] = now
 	})
 	if err != nil {
 		return nil, fmt.Errorf("update user: %w", err)
 	}
 
-	tables := userdata.FullClientTableMap(snapshot)
-	diff := userdata.BuildDiffFromTables(userdata.SelectTables(tables, []string{"IUserOmikuji"}))
-
 	return &pb.OmikujiDrawResponse{
-		OmikujiResultAssetId: s.catalog.LookupAssetId(req.OmikujiId),
+		OmikujiResultAssetId: s.holder.Get().Omikuji.LookupAssetId(req.OmikujiId),
 		OmikujiItem:          []*pb.OmikujiItem{},
-		DiffUserData:         diff,
 	}, nil
 }
